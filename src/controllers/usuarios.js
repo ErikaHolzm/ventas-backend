@@ -172,14 +172,16 @@ export async function loginUsuario(req, res) {
 
     // respuesta final
     res.json({
-      mensaje: "Login exitoso",
-      token,
-      usuario: {
-        id: rows[0].id,
-        nombre: rows[0].nombre,
-        email: rows[0].email
-      }
+        mensaje: "Login exitoso",
+        token,
+        usuario: {
+            id: rows[0].id,
+            nombre: rows[0].nombre,
+            email: rows[0].email,
+            rol: rows[0].rol  
+        }
     });
+
 
   } catch (error) {
     console.error("Error en login:", error);
