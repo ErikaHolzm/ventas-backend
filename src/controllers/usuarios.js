@@ -13,7 +13,7 @@ function esContrasenaFuerte(contrasena) {
 export async function getUsuarios(req, res) {
   try {
     const [rows] = await db.query(
-      "SELECT id, nombre, email FROM usuarios WHERE activo = 1"
+      "SELECT id, nombre, email, rol FROM usuarios WHERE activo = 1"
     );
 
     res.json(rows);
@@ -28,7 +28,7 @@ export async function getUsuarioPorId(req, res) {
     const usuarioId = req.params.id; 
 
     const [rows] = await db.query(
-      "SELECT id, nombre, email FROM usuarios WHERE id = ? AND activo = 1",
+      "SELECT id, nombre, email, rol FROM usuarios WHERE id = ? AND activo = 1",
       [ usuarioId ]
     );
 
@@ -87,28 +87,65 @@ export async function actualizarUsuario(req, res) {
     const usuarioId = req.params.id;
     const { nombre, email, contrasena } = req.body;
 
-    
-    if ( !nombre && !email && !contrasena ) {
-      return res.status(400).json({ mensaje: "Debes enviar al menos un campo para actualizar" });
+    if (!nombre && !email && !contrasena) {
+      return res
+        .status(400)
+        .json({ mensaje: "Debes enviar al menos un campo para actualizar" });
     }
 
     
-    const [result] = await db.query(
-      "UPDATE usuarios SET nombre = ?, email = ?, contrasena = ? WHERE id = ?",
-      [nombre, email, contrasena, usuarioId]
-    );
+    const campos = [];
+    const valores = [];
+
+    if (nombre) {
+      campos.push("nombre = ?");
+      valores.push(nombre);
+    }
+
+    if (email) {
+       
+      const [existe] = await db.query(
+        "SELECT id FROM usuarios WHERE email = ? AND id <> ?",
+        [email, usuarioId]
+      );
+
+      if (existe.length > 0) {
+        return res.status(400).json({ mensaje: "Email ya registrado" });
+      }
+
+      campos.push("email = ?");
+      valores.push(email);
+    }
+
+    if (contrasena) {
+      
+      if (!esContrasenaFuerte(contrasena)) {
+        return res.status(400).json({ mensaje: "Contraseña débil" });
+      }
+
+      const contrasenaEncriptada = await bcrypt.hash(contrasena, 10);
+      campos.push("contrasena = ?");
+      valores.push(contrasenaEncriptada);
+    }
+
+     
+    valores.push(usuarioId);
+
+    const sql = `UPDATE usuarios SET ${campos.join(", ")} WHERE id = ?`;
+
+    const [result] = await db.query(sql, valores);
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ mensaje: "Usuario no encontrado" });
     }
 
     res.json({ mensaje: "Usuario actualizado correctamente" });
-
   } catch (error) {
     console.error("Error actualizando usuario:", error);
     res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
+
 
 export async function eliminarUsuario(req, res) {
   try {

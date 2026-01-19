@@ -1,33 +1,79 @@
 import db from "../config/db.js";
 
+const ESTADOS_VALIDOS = ["pendiente", "en_proceso", "entregado", "cancelado"];
+
+// =======================
+// CREAR PEDIDO (POS)
+// =======================
 export async function crearPedido(req, res) {
+  const conn = await db.getConnection();
+
   try {
     const { usuario_id, items } = req.body;
 
-    if (!usuario_id || !items || items.length === 0) {
+    if (!usuario_id || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ mensaje: "Faltan datos del pedido" });
     }
 
-    //calcular total
-    const total = items.reduce((sum, item) => sum + item.precio * item.cantidad, 0);
+    // validar items básicos
+    for (const item of items) {
+      if (!item.producto_id || !item.cantidad || Number(item.cantidad) <= 0) {
+        return res.status(400).json({ mensaje: "Items inválidos" });
+      }
+    }
 
-    // insertar pedido
-    const [pedidoResult] = await db.query(
-      "INSERT INTO pedidos (usuario_id, total, estado) VALUES (?, ?, 'pendiente')",
+    await conn.beginTransaction();
+
+    // 1) Traer precios reales desde DB (NO confiar en front)
+    const productoIds = items.map(i => i.producto_id);
+
+    const [productos] = await conn.query(
+      `SELECT id, precio
+       FROM productos
+       WHERE id IN (${productoIds.map(() => "?").join(",")})
+       AND activo = 1`,
+      productoIds
+    );
+
+    const precios = new Map(productos.map(p => [p.id, Number(p.precio)]));
+
+    // si algún producto no existe/está inactivo => error
+    for (const item of items) {
+      if (!precios.has(item.producto_id)) {
+        await conn.rollback();
+        return res.status(400).json({
+          mensaje: `Producto inválido o inactivo: ${item.producto_id}`
+        });
+      }
+    }
+
+    // 2) Calcular total
+    const total = items.reduce((sum, item) => {
+      return sum + precios.get(item.producto_id) * Number(item.cantidad);
+    }, 0);
+
+    // 3) Insertar pedido (creado_en si existe en tu tabla)
+    const [pedidoResult] = await conn.query(
+      "INSERT INTO pedidos (usuario_id, total, creado_en, estado) VALUES (?, ?, NOW(), 'pendiente')",
       [usuario_id, total]
     );
 
     const pedidoId = pedidoResult.insertId;
 
-    // insertar detalles
+    // 4) Insertar items en items_pedido (con subtotal)
     for (const item of items) {
-      await db.query(
-        "INSERT INTO pedido_detalle (pedido_id, producto_id, cantidad, precio) VALUES (?, ?, ?, ?)",
-        [pedidoId, item.producto_id, item.cantidad, item.precio]
+      const precio = precios.get(item.producto_id);
+      const subtotal = precio * Number(item.cantidad);
+
+      await conn.query(
+        "INSERT INTO items_pedido (pedido_id, producto_id, cantidad, subtotal) VALUES (?, ?, ?, ?)",
+        [pedidoId, item.producto_id, item.cantidad, subtotal]
       );
     }
 
-    res.status(201).json({
+    await conn.commit();
+
+    return res.status(201).json({
       mensaje: "Pedido creado correctamente",
       pedidoId,
       total,
@@ -35,42 +81,57 @@ export async function crearPedido(req, res) {
     });
 
   } catch (error) {
+    try { await conn.rollback(); } catch {}
     console.error("Error creando pedido:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
+  } finally {
+    conn.release();
   }
 }
 
-
+// =======================
+// OBTENER PEDIDOS (según rol)
+// =======================
 export async function obtenerPedidos(req, res) {
   try {
-    const rol = req.usuario.rol;
+    const rol = req.usuario?.rol; // respetamos tu estructura
 
-    let query = "SELECT * FROM pedidos";
+    let query = "SELECT id, usuario_id, total, creado_en, estado FROM pedidos";
+    const params = [];
 
+    // Cocina ve solo los que están pendientes o en proceso
     if (rol === "cocina") {
-      query = "SELECT * FROM pedidos WHERE estado IN ('pendiente', 'en_cocina')";
+      query += " WHERE estado IN ('pendiente', 'en_proceso')";
     }
 
-    const [rows] = await db.query(query);
+    // Cajero: opcional: solo los del día (si querés)
+    if (rol === "cajero") {
+      query += " WHERE DATE(creado_en) = CURDATE()";
+    }
 
-    res.json(rows);
+    query += " ORDER BY creado_en DESC";
+
+    const [rows] = await db.query(query, params);
+    return res.json(rows);
 
   } catch (error) {
     console.error("Error obteniendo pedidos:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
 
-
+// =======================
+// CAMBIAR ESTADO (cocina/admin)
+// =======================
 export async function cambiarEstadoPedido(req, res) {
   try {
     const pedidoId = req.params.id;
     const { estado } = req.body;
 
-    const estadosValidos = ["pendiente", "en_cocina", "listo", "entregado", "cancelado"];
-
-    if (!estadosValidos.includes(estado)) {
-      return res.status(400).json({ mensaje: "Estado inválido" });
+    if (!ESTADOS_VALIDOS.includes(estado)) {
+      return res.status(400).json({
+        mensaje: `Estado inválido. Usá: ${ESTADOS_VALIDOS.join(", ")}`
+      });
     }
 
     const [result] = await db.query(
@@ -82,22 +143,23 @@ export async function cambiarEstadoPedido(req, res) {
       return res.status(404).json({ mensaje: "Pedido no encontrado" });
     }
 
-    res.json({ mensaje: "Estado actualizado correctamente" });
+    return res.json({ mensaje: "Estado actualizado correctamente", estado });
 
   } catch (error) {
     console.error("Error cambiando estado:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
 
-
+// =======================
+// OBTENER PEDIDO POR ID (con items + nombre)
+// =======================
 export async function obtenerPedidoPorId(req, res) {
   try {
     const pedidoId = req.params.id;
 
-    // buscar el pedido
     const [pedido] = await db.query(
-      "SELECT * FROM pedidos WHERE id = ?",
+      "SELECT id, usuario_id, total, creado_en, estado FROM pedidos WHERE id = ?",
       [pedidoId]
     );
 
@@ -105,45 +167,57 @@ export async function obtenerPedidoPorId(req, res) {
       return res.status(404).json({ mensaje: "Pedido no encontrado" });
     }
 
-    // buscar detalles + nombre de productos
     const [items] = await db.query(
-      `SELECT pd.producto_id, p.nombre AS producto, pd.cantidad, pd.precio 
-       FROM pedido_detalle pd
-       JOIN productos p ON p.id = pd.producto_id
-       WHERE pd.pedido_id = ?`,
+      `SELECT 
+        i.producto_id,
+        p.nombre AS producto,
+        i.cantidad,
+        i.subtotal
+      FROM items_pedido i
+      JOIN productos p ON p.id = i.producto_id
+      WHERE i.pedido_id = ?`,
       [pedidoId]
     );
 
-    // devolver todo junto
-    res.json({
+    return res.json({
       pedido: pedido[0],
       items
     });
 
   } catch (error) {
     console.error("Error obteniendo pedido:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
-  
 
+// =======================
+// REPORTE DEL DÍA (admin)
+// =======================
 export async function reporteDelDia(req, res) {
   try {
-    // total de pedidos del día
+    // total pedidos del día
     const [totalPedidos] = await db.query(`
       SELECT COUNT(*) AS total
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
     `);
 
-    // total de ventas del día
+    // ventas totales del día (todos los estados)
     const [ventas] = await db.query(`
-      SELECT SUM(total) AS ventas_totales
+      SELECT COALESCE(SUM(total), 0) AS ventas_totales
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
     `);
 
-    // cantidad de pedidos por estado
+    // ventas reales del día (solo entregados)
+    const [ventasEntregadas] = await db.query(`
+      SELECT COALESCE(SUM(total), 0) AS ventas_entregadas
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+      AND estado = 'entregado'
+    `);
+
+    // pedidos por estado (solo estados del enum)
     const [estados] = await db.query(`
       SELECT estado, COUNT(*) AS cantidad
       FROM pedidos
@@ -151,38 +225,36 @@ export async function reporteDelDia(req, res) {
       GROUP BY estado
     `);
 
-    // convertir a objeto más cómodo
     const resumenEstados = {
       pendiente: 0,
-      en_cocina: 0,
-      listo: 0,
+      en_proceso: 0,
       entregado: 0,
       cancelado: 0
     };
 
     estados.forEach(e => {
-      resumenEstados[e.estado] = e.cantidad;
+      if (resumenEstados[e.estado] !== undefined) {
+        resumenEstados[e.estado] = e.cantidad;
+      }
     });
 
-    // ticket promedio  
-    const ticketPromedio =
-      ventas[0].ventas_totales && totalPedidos[0].total > 0
-        ? ventas[0].ventas_totales / totalPedidos[0].total
-        : 0;
+    // ticket promedio (sobre todos los pedidos del día)
+    const totalP = Number(totalPedidos[0].total || 0);
+    const ventasTot = Number(ventas[0].ventas_totales || 0);
 
-     
-    res.json({
+    const ticketPromedio = totalP > 0 ? ventasTot / totalP : 0;
+
+    return res.json({
       fecha: new Date().toISOString().slice(0, 10),
-      total_pedidos: totalPedidos[0].total,
-      ventas_totales: ventas[0].ventas_totales ?? 0,
+      total_pedidos: totalP,
+      ventas_totales: ventasTot,
+      ventas_entregadas: Number(ventasEntregadas[0].ventas_entregadas || 0),
       estados: resumenEstados,
       ticket_promedio: ticketPromedio
     });
 
   } catch (error) {
     console.error("Error generando reporte del día:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
-
-

@@ -5,7 +5,8 @@ export async function getProductosPorCategoria(req, res) {
     const categoriaId = req.params.categoria_id;
 
     const [rows] = await db.query(
-      "SELECT id, nombre, precio FROM productos WHERE categoria_id = ? AND activo = 1",
+      "SELECT id, nombre, precio, imagen_url FROM productos WHERE categoria_id = ? AND activo = 1",
+
       [categoriaId]  
     );
 
@@ -18,7 +19,7 @@ export async function getProductosPorCategoria(req, res) {
 
 export async function crearProducto(req, res) {
   try {
-    const { nombre, precio, categoria_id } = req.body;
+    const { nombre, precio, categoria_id, imagen_url } = req.body;
 
     // validar campos obligatorios
     if (!nombre || !precio || !categoria_id) {
@@ -47,8 +48,8 @@ export async function crearProducto(req, res) {
 
     // insertar producto
     const [result] = await db.query(
-      "INSERT INTO productos (nombre, precio, categoria_id) VALUES (?, ?, ?)",
-      [nombre, precio, categoria_id]
+       "INSERT INTO productos (nombre, precio, categoria_id, imagen_url, activo) VALUES (?, ?, ?, ?, 1)",
+      [nombre, precio, categoria_id, imagen_url || null]
     );
 
     // respuesta de éxito
