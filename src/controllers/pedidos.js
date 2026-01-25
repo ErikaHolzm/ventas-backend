@@ -2,29 +2,36 @@ import db from "../config/db.js";
 
 const ESTADOS_VALIDOS = ["pendiente", "en_proceso", "entregado", "cancelado"];
 
-// =======================
-// CREAR PEDIDO (POS)
-// =======================
+
 export async function crearPedido(req, res) {
   const conn = await db.getConnection();
 
   try {
-    const { usuario_id, items } = req.body;
+    const { items } = req.body;
 
-    if (!usuario_id || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ mensaje: "Faltan datos del pedido" });
+     
+    const usuario_id = req.usuario?.id;
+
+    if (!usuario_id) {
+      return res.status(401).json({ mensaje: "Usuario no identificado en token" });
     }
 
-    // validar items básicos
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ mensaje: "Faltan items del pedido" });
+    }
+
+     
     for (const item of items) {
       if (!item.producto_id || !item.cantidad || Number(item.cantidad) <= 0) {
         return res.status(400).json({ mensaje: "Items inválidos" });
       }
     }
 
+     
     await conn.beginTransaction();
 
-    // 1) Traer precios reales desde DB (NO confiar en front)
+
+    
     const productoIds = items.map(i => i.producto_id);
 
     const [productos] = await conn.query(
@@ -47,12 +54,12 @@ export async function crearPedido(req, res) {
       }
     }
 
-    // 2) Calcular total
+    
     const total = items.reduce((sum, item) => {
       return sum + precios.get(item.producto_id) * Number(item.cantidad);
     }, 0);
 
-    // 3) Insertar pedido (creado_en si existe en tu tabla)
+    
     const [pedidoResult] = await conn.query(
       "INSERT INTO pedidos (usuario_id, total, creado_en, estado) VALUES (?, ?, NOW(), 'pendiente')",
       [usuario_id, total]
@@ -60,15 +67,17 @@ export async function crearPedido(req, res) {
 
     const pedidoId = pedidoResult.insertId;
 
-    // 4) Insertar items en items_pedido (con subtotal)
+    
     for (const item of items) {
       const precio = precios.get(item.producto_id);
       const subtotal = precio * Number(item.cantidad);
 
       await conn.query(
-        "INSERT INTO items_pedido (pedido_id, producto_id, cantidad, subtotal) VALUES (?, ?, ?, ?)",
-        [pedidoId, item.producto_id, item.cantidad, subtotal]
+        `INSERT INTO items_pedido (pedido_id, producto_id, cantidad, precio_unitario, subtotal)
+        VALUES (?, ?, ?, ?, ?)`,
+        [pedidoId, item.producto_id, item.cantidad, precio, subtotal]
       );
+
     }
 
     await conn.commit();
@@ -89,14 +98,13 @@ export async function crearPedido(req, res) {
   }
 }
 
-// =======================
-// OBTENER PEDIDOS (según rol)
-// =======================
+
 export async function obtenerPedidos(req, res) {
   try {
     const rol = req.usuario?.rol; // respetamos tu estructura
 
-    let query = "SELECT id, usuario_id, total, creado_en, estado FROM pedidos";
+    let query = "SELECT id, usuario_id, total, creado_en, estado, pagado, metodo_pago, pagado_en FROM pedidos";
+
     const params = [];
 
     // Cocina ve solo los que están pendientes o en proceso
@@ -120,9 +128,7 @@ export async function obtenerPedidos(req, res) {
   }
 }
 
-// =======================
-// CAMBIAR ESTADO (cocina/admin)
-// =======================
+
 export async function cambiarEstadoPedido(req, res) {
   try {
     const pedidoId = req.params.id;
@@ -132,6 +138,24 @@ export async function cambiarEstadoPedido(req, res) {
       return res.status(400).json({
         mensaje: `Estado inválido. Usá: ${ESTADOS_VALIDOS.join(", ")}`
       });
+    }
+
+    // ✅ Regla: NO se puede entregar si no está pagado
+    if (estado === "entregado") {
+      const [rows] = await db.query(
+        "SELECT pagado, estado FROM pedidos WHERE id = ?",
+        [pedidoId]
+      );
+
+      if (!rows.length) return res.status(404).json({ mensaje: "Pedido no encontrado" });
+
+      if (rows[0].estado === "cancelado") {
+        return res.status(400).json({ mensaje: "No se puede entregar un pedido CANCELADO" });
+      }
+
+      if (Number(rows[0].pagado) !== 1) {
+        return res.status(400).json({ mensaje: "No se puede ENTREGAR: el pedido NO está pagado" });
+      }
     }
 
     const [result] = await db.query(
@@ -144,16 +168,14 @@ export async function cambiarEstadoPedido(req, res) {
     }
 
     return res.json({ mensaje: "Estado actualizado correctamente", estado });
-
   } catch (error) {
     console.error("Error cambiando estado:", error);
     return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
 
-// =======================
-// OBTENER PEDIDO POR ID (con items + nombre)
-// =======================
+
+
 export async function obtenerPedidoPorId(req, res) {
   try {
     const pedidoId = req.params.id;
@@ -190,40 +212,145 @@ export async function obtenerPedidoPorId(req, res) {
   }
 }
 
-// =======================
-// REPORTE DEL DÍA (admin)
-// =======================
+
 export async function reporteDelDia(req, res) {
   try {
-    // total pedidos del día
-    const [totalPedidos] = await db.query(`
+    // Pedidos del día (todos)
+    const [totalPedidosRows] = await db.query(`
       SELECT COUNT(*) AS total
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
     `);
 
-    // ventas totales del día (todos los estados)
-    const [ventas] = await db.query(`
-      SELECT COALESCE(SUM(total), 0) AS ventas_totales
+    // Pedidos cobrados del día
+    const [cobradosRows] = await db.query(`
+      SELECT COUNT(*) AS total
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
+        AND pagado = 1
     `);
 
-    // ventas reales del día (solo entregados)
-    const [ventasEntregadas] = await db.query(`
-      SELECT COALESCE(SUM(total), 0) AS ventas_entregadas
+    // Total vendido REAL (solo cobrados)
+    const [ventasCobradasRows] = await db.query(`
+      SELECT COALESCE(SUM(total), 0) AS total
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
-      AND estado = 'entregado'
+        AND pagado = 1
     `);
 
-    // pedidos por estado (solo estados del enum)
-    const [estados] = await db.query(`
+    // Total entregado (logística)
+    const [ventasEntregadasRows] = await db.query(`
+      SELECT COALESCE(SUM(total), 0) AS total
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+        AND estado = 'entregado'
+    `);
+
+    // Por estado
+    const [estadosRows] = await db.query(`
       SELECT estado, COUNT(*) AS cantidad
       FROM pedidos
       WHERE DATE(creado_en) = CURDATE()
       GROUP BY estado
     `);
+
+    const estados = {
+      pendiente: 0,
+      en_proceso: 0,
+      entregado: 0,
+      cancelado: 0
+    };
+
+    estadosRows.forEach((e) => {
+      if (estados[e.estado] !== undefined) {
+        estados[e.estado] = Number(e.cantidad || 0);
+      }
+    });
+
+    //  Por método de pago (solo cobrados)
+    const [porMetodoRows] = await db.query(`
+      SELECT
+        metodo_pago,
+        COUNT(*) AS cantidad,
+        COALESCE(SUM(total), 0) AS total
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+        AND pagado = 1
+      GROUP BY metodo_pago
+    `);
+
+    // lo dejamos armado para el front
+    const por_metodo = {
+      efectivo: { cantidad: 0, total: 0 },
+      debito: { cantidad: 0, total: 0 },
+      credito: { cantidad: 0, total: 0 },
+      transferencia: { cantidad: 0, total: 0 }
+    };
+
+    porMetodoRows.forEach((r) => {
+      const mp = String(r.metodo_pago || "").toLowerCase();
+      if (por_metodo[mp]) {
+        por_metodo[mp] = {
+          cantidad: Number(r.cantidad || 0),
+          total: Number(r.total || 0)
+        };
+      }
+    });
+
+    return res.json({
+      fecha: new Date().toISOString().slice(0, 10),
+
+      total_pedidos: Number(totalPedidosRows[0]?.total || 0),
+      pedidos_cobrados: Number(cobradosRows[0]?.total || 0),
+
+      // (total de ventas del día)
+      ventas_cobradas: Number(ventasCobradasRows[0]?.total || 0),
+
+      // opcional
+      ventas_entregadas: Number(ventasEntregadasRows[0]?.total || 0),
+
+      estados,
+      por_metodo
+    });
+  } catch (error) {
+    console.error("Error generando reporte del día:", error);
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+}
+export async function resumenDelDia(req, res) {
+  try {
+    const rol = req.usuario?.rol;
+    const usuario_id = req.usuario?.id;
+
+    // ✅ si es cajero, mostramos SOLO sus ventas del día
+    const filtroUsuario = rol === "cajero" ? " AND usuario_id = ? " : "";
+    const params = rol === "cajero" ? [usuario_id] : [];
+
+    // 1) total de pedidos del día
+    const [totalPedidos] = await db.query(`
+      SELECT COUNT(*) AS total
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+      ${filtroUsuario}
+    `, params);
+
+    // 2) total cobrado del día (pagado=1)
+    const [ventasCobradas] = await db.query(`
+      SELECT COALESCE(SUM(total), 0) AS total
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+        AND pagado = 1
+      ${filtroUsuario}
+    `, params);
+
+    // 3) estados del día (para mini resumen)
+    const [estadosRows] = await db.query(`
+      SELECT estado, COUNT(*) AS cantidad
+      FROM pedidos
+      WHERE DATE(creado_en) = CURDATE()
+      ${filtroUsuario}
+      GROUP BY estado
+    `, params);
 
     const resumenEstados = {
       pendiente: 0,
@@ -232,29 +359,58 @@ export async function reporteDelDia(req, res) {
       cancelado: 0
     };
 
-    estados.forEach(e => {
+    estadosRows.forEach((e) => {
       if (resumenEstados[e.estado] !== undefined) {
-        resumenEstados[e.estado] = e.cantidad;
+        resumenEstados[e.estado] = Number(e.cantidad || 0);
       }
     });
 
-    // ticket promedio (sobre todos los pedidos del día)
-    const totalP = Number(totalPedidos[0].total || 0);
-    const ventasTot = Number(ventas[0].ventas_totales || 0);
-
-    const ticketPromedio = totalP > 0 ? ventasTot / totalP : 0;
-
     return res.json({
       fecha: new Date().toISOString().slice(0, 10),
-      total_pedidos: totalP,
-      ventas_totales: ventasTot,
-      ventas_entregadas: Number(ventasEntregadas[0].ventas_entregadas || 0),
-      estados: resumenEstados,
-      ticket_promedio: ticketPromedio
+      ventas: Number(totalPedidos[0]?.total || 0),
+      total: Number(ventasCobradas[0]?.total || 0),
+      estados: resumenEstados
     });
-
   } catch (error) {
-    console.error("Error generando reporte del día:", error);
+    console.error("Error resumenDelDia:", error);
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+}
+
+export async function cobrarPedido(req, res) {
+  try {
+    const pedidoId = req.params.id;
+    const { metodo_pago } = req.body;
+
+    const validos = ["efectivo", "debito", "credito", "transferencia"];
+    if (!validos.includes(metodo_pago)) {
+      return res.status(400).json({ mensaje: "Método de pago inválido" });
+    }
+
+    const [rows] = await db.query(
+      "SELECT estado, pagado FROM pedidos WHERE id = ?",
+      [pedidoId]
+    );
+
+    if (!rows.length) return res.status(404).json({ mensaje: "Pedido no encontrado" });
+
+    if (Number(rows[0].pagado) === 1) {
+      return res.status(400).json({ mensaje: "Ese pedido ya está pagado" });
+    }
+
+    // ✅ COBRAR ANTES: solo bloqueo si está cancelado
+    if (rows[0].estado === "cancelado") {
+      return res.status(400).json({ mensaje: "No se puede cobrar un pedido CANCELADO" });
+    }
+
+    await db.query(
+      "UPDATE pedidos SET pagado = 1, pagado_en = NOW(), metodo_pago = ? WHERE id = ?",
+      [metodo_pago, pedidoId]
+    );
+
+    return res.json({ mensaje: "Pedido cobrado", pedidoId, metodo_pago, pagado: 1 });
+  } catch (error) {
+    console.error("Error cobrarPedido:", error);
     return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }

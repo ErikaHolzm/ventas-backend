@@ -2,14 +2,14 @@ import jwt from "jsonwebtoken";
 
 export function verificarToken(req, res, next) {
   try {
-    //obtener el header Authorization
+     
     const authHeader = req.headers.authorization;
 
     if (!authHeader) {
       return res.status(401).json({ mensaje: "Token no proporcionado" });
     }
 
-    //formato esperado: "Bearer token"
+     
     const token = authHeader.split(" ")[1];
 
     if (!token) {

@@ -45,42 +45,51 @@ export async function getUsuarioPorId(req, res) {
 
 export async function crearUsuario(req, res) {
   try {
-    const { nombre, email, contrasena } = req.body;   
-    
-    const [rows] = await db.query("SELECT email FROM usuarios WHERE email = ?",
-        [ email ]
-    );
-    
-    if (rows.length > 0){
-        return res.status(400).json ({mensaje: "Email ya registrado"})
-    }
-    
-    if (!nombre || !email || !contrasena) {     //validamos
+    const { nombre, email, contrasena } = req.body;
+
+    // validar campos
+    if (!nombre || !email || !contrasena) {
       return res.status(400).json({ mensaje: "Faltan campos obligatorios" });
     }
 
-    if (!esContrasenaFuerte(contrasena)) {
-        return res.status(400).json({ mensaje: "Contraseña débil" });
-    }
-
-    // Encriptar contraseña
-    const contrasenaEncriptada = await bcrypt.hash(contrasena, 10);
-
-    const [result] = await db.query(
-      "INSERT INTO usuarios (nombre, email, contrasena) VALUES (?, ?, ?)",
-      [ nombre, email, contrasenaEncriptada ]   //tomamos los datos del body       
+    // email repetido
+    const [rows] = await db.query(
+      "SELECT email FROM usuarios WHERE email = ?",
+      [email]
     );
 
-    res.status(201).json({
+    if (rows.length > 0) {
+      return res.status(400).json({ mensaje: "Email ya registrado" });
+    }
+
+    // contraseña fuerte
+    if (!esContrasenaFuerte(contrasena)) {
+      return res.status(400).json({ mensaje: "Contraseña débil" });
+    }
+
+    // encriptar contraseña
+    const contrasenaEncriptada = await bcrypt.hash(contrasena, 10);
+
+     
+    const rolPorDefecto = "cajero";  
+
+    const [result] = await db.query(
+      "INSERT INTO usuarios (nombre, email, contrasena, rol) VALUES (?, ?, ?, ?)",
+      [nombre, email, contrasenaEncriptada, rolPorDefecto]
+    );
+
+    return res.status(201).json({
       mensaje: "Usuario creado correctamente",
-      usuarioId: result.insertId   
+      usuarioId: result.insertId,
+      rol: rolPorDefecto
     });
 
   } catch (error) {
     console.error("Error creando usuario:", error);
-    res.status(500).json({ mensaje: "Error interno del servidor" });
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
+
 
 export async function actualizarUsuario(req, res) {
   try {
@@ -223,6 +232,35 @@ export async function loginUsuario(req, res) {
   } catch (error) {
     console.error("Error en login:", error);
     res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+}
+
+export async function cambiarRolUsuario(req, res) {
+  try {
+    const usuarioId = req.params.id;
+    const { rol } = req.body;
+
+    const ROLES_VALIDOS = ["admin", "cajero", "empleado", "cocina"];
+
+    if (!rol || !ROLES_VALIDOS.includes(rol)) {
+      return res.status(400).json({
+        mensaje: `Rol inválido. Usá: ${ROLES_VALIDOS.join(", ")}`
+      });
+    }
+
+    const [result] = await db.query(
+      "UPDATE usuarios SET rol = ? WHERE id = ? AND activo = 1",
+      [rol, usuarioId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ mensaje: "Usuario no encontrado" });
+    }
+
+    return res.json({ mensaje: "Rol actualizado correctamente", rol });
+  } catch (error) {
+    console.error("Error cambiando rol:", error);
+    return res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 }
 

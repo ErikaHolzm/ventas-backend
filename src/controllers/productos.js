@@ -73,7 +73,7 @@ export async function desactivarProducto(req, res) {
       [productoId]
     );
 
-    // si no se modificó ninguna fila → no existe
+    // si no se modificó ninguna fila   no existe
     if (result.affectedRows === 0) {
       return res.status(404).json({ mensaje: "Producto no encontrado" });
     }
